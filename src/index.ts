@@ -17,6 +17,11 @@ import { UserAgentComposer } from "./useragent.js";
 import { packageVersion } from "./version.js";
 import { DomainsManager } from "./shared/domains.js";
 
+import dotenv from "dotenv";
+dotenv.config();
+
+console.log("AZURE_CLIENT_ID:", process.env.AZURE_CLIENT_ID);
+
 // ----------------- ENV -----------------
 function isGitHubCodespaceEnv(): boolean {
   return process.env.CODESPACES === "true" && !!process.env.CODESPACE_NAME;
@@ -28,7 +33,6 @@ const argv = yargs(hideBin(process.argv))
   .scriptName("mcp-server-azuredevops")
   .usage("Usage: $0 <organization> [options]")
   .version(packageVersion)
-  // Make organization a required option, fallback for positional
   .option("organization", {
     alias: "o",
     type: "string",
@@ -45,9 +49,9 @@ const argv = yargs(hideBin(process.argv))
   })
   .option("authentication", {
     alias: "a",
-    describe: "Type of authentication: 'interactive', 'azcli', 'env', 'external'. Default: interactive",
+    describe: "Type of authentication: 'interactive', 'azcli', 'env', 'external', 'obo'. Default: interactive",
     type: "string",
-    choices: ["interactive", "azcli", "env", "external"],
+    choices: ["interactive", "azcli", "env", "external", "obo"],
     default: defaultAuthenticationType,
   })
   .option("tenant", { alias: "t", type: "string", describe: "Azure tenant ID" })
@@ -56,7 +60,6 @@ const argv = yargs(hideBin(process.argv))
   .help()
   .parseSync();
 
-// Fallback: if user provided first positional arg, treat it as organization
 if (!argv.organization && process.argv[2] && !process.argv[2].startsWith("-")) {
   argv.organization = process.argv[2];
 }
@@ -105,7 +108,7 @@ async function main() {
   const tenantId = (await getOrgTenant(orgName)) ?? argv.tenant;
   let externalToken: string | undefined;
 
-  // Token provider function
+  // Token provider for external auth
   const tokenProvider = async () => {
     if (!externalToken) {
       throw new Error("External token must be provided for 'external' auth type.");
@@ -113,17 +116,32 @@ async function main() {
     return externalToken;
   };
 
-
   // ----------------- AUTHENTICATOR -----------------
-  
   let authenticator: (userAssertion?: string) => Promise<string>;
 
   if (argv.authentication === "external") {
-    authenticator = tokenProvider; // dynamic per-request
+    authenticator = tokenProvider;
+  } else if (argv.authentication === "obo") {
+    if (!process.env.AZURE_CLIENT_ID || !process.env.AZURE_CLIENT_SECRET) {
+      throw new Error(
+        "OBO authentication requires AZURE_CLIENT_ID and AZURE_CLIENT_SECRET environment variables."
+      );
+    }
+    authenticator = createAuthenticator("obo", argv.tenant, {
+      clientId: process.env.AZURE_CLIENT_ID,
+      clientSecret: process.env.AZURE_CLIENT_SECRET,
+    });
   } else {
     authenticator = createAuthenticator(argv.authentication, argv.tenant);
   }
- 
+
+  // ----------------- WRAP AUTHENTICATOR for per-request token -----------------
+  const originalAuthenticator = authenticator;
+  authenticator = async (userAssertion?: string) => {
+    if (userAssertion) return originalAuthenticator(userAssertion);
+    if (externalToken) return originalAuthenticator(externalToken);
+    return originalAuthenticator();
+  };
 
   // ----------------- CONFIGURE TOOLS -----------------
   configurePrompts(server);
@@ -140,81 +158,67 @@ async function main() {
     const app = express();
     app.use(express.json());
 
-    // Map of sessionId => transport
     const transports: Record<string, StreamableHTTPServerTransport> = {};
 
-  app.post('/mcp', async (req: Request, res: Response) => {
-      // Check for existing session ID
-      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    app.post("/mcp", async (req: Request, res: Response) => {
+      const sessionId = req.headers["mcp-session-id"] as string | undefined;
+      let userAssertion: string | undefined;
+
       if (argv.authentication === "external") {
-        const token = req.headers["authorization"]?.split(" ")[1]; // Bearer <token>
-        externalToken = token; // store per-request
+        externalToken = req.headers["authorization"]?.split(" ")[1];
+
+      } else if (argv.authentication === "obo") {
+        userAssertion = req.headers["authorization"]?.split(" ")[1];
+        if (!userAssertion) {
+          res.status(400).json({ error: "User token required for OBO authentication" });
+          return;
+        }
+        externalToken = userAssertion; // used in wrapped authenticator
       }
 
       let transport: StreamableHTTPServerTransport;
 
-      console.log("Body received:", req.body);
-      console.log("isInitializeBody:", isInitializeBody(req.body));
-
       if (sessionId && transports[sessionId]) {
-        // Reuse existing transport
         transport = transports[sessionId];
       } else if (!sessionId && isInitializeBody(req.body)) {
-        // New initialization request
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => crypto.randomUUID(),
           onsessioninitialized: (sessionId) => {
-            
             transports[sessionId] = transport;
           },
-          // DNS rebinding protection is disabled by default for backwards compatibility. If you are running this server
-          // locally, make sure to set:
-          // enableDnsRebindingProtection: true,
-          // allowedHosts: ['127.0.0.1'],
         });
 
-        // Clean up transport when closed
         transport.onclose = () => {
-          if (transport.sessionId) {
-            delete transports[transport.sessionId];
-          }
+          if (transport.sessionId) delete transports[transport.sessionId];
         };
-        
 
-        // ... set up server resources, tools, and prompts ...
-
-        // Connect to the MCP server
         await server.connect(transport);
       } else {
-        // Invalid request
         res.status(400).json({
-          jsonrpc: '2.0',
-          error: {
-            code: -32000,
-            message: 'Bad Request: No valid session ID provided',
-          },
+          jsonrpc: "2.0",
+          error: { code: -32000, message: "Bad Request: No valid session ID provided" },
           id: null,
         });
         return;
       }
 
-      // Handle the request
-      await transport.handleRequest(req, res, req.body);
+      try {
+        await transport.handleRequest(req, res, req.body);
+      } finally {
+        if (argv.authentication === "obo") externalToken = undefined;
+      }
     });
 
-
-
-    // GET / DELETE handler
     const handleSessionRequest = async (req: express.Request, res: express.Response) => {
-      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      const sessionId = req.headers["mcp-session-id"] as string | undefined;
       if (!sessionId || !transports[sessionId]) {
-        res.status(400).send('Invalid or missing session ID');
+        res.status(400).send("Invalid or missing session ID");
         return;
       }
-      
-        const transport = transports[sessionId];
-        await transport.handleRequest(req, res);
-      };
+
+      const transport = transports[sessionId];
+      await transport.handleRequest(req, res);
+    };
 
     app.get("/mcp", handleSessionRequest);
     app.delete("/mcp", handleSessionRequest);

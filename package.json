@@ -42,6 +42,7 @@
     "azure-devops-extension-api": "^4.252.0",
     "azure-devops-extension-sdk": "^4.0.2",
     "azure-devops-node-api": "^15.1.0",
+    "dotenv": "^17.2.2",
     "express": "^5.1.0",
     "yargs": "^18.0.0",
     "zod": "^3.25.63",
@@ -49,6 +50,7 @@
   },
   "devDependencies": {
     "@modelcontextprotocol/inspector": "^0.16.1",
+    "@types/dotenv": "^6.1.1",
     "@types/express": "^5.0.3",
     "@types/jest": "^30.0.0",
     "@types/node": "^22",
