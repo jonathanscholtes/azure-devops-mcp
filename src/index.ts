@@ -45,9 +45,9 @@ const argv = yargs(hideBin(process.argv))
   })
   .option("authentication", {
     alias: "a",
-    describe: "Type of authentication: 'interactive', 'azcli', 'env', 'obo'. Default: interactive",
+    describe: "Type of authentication: 'interactive', 'azcli', 'env', 'external'. Default: interactive",
     type: "string",
-    choices: ["interactive", "azcli", "env", "obo"],
+    choices: ["interactive", "azcli", "env", "external"],
     default: defaultAuthenticationType,
   })
   .option("tenant", { alias: "t", type: "string", describe: "Azure tenant ID" })
@@ -103,21 +103,27 @@ async function main() {
   };
 
   const tenantId = (await getOrgTenant(orgName)) ?? argv.tenant;
+  let externalToken: string | undefined;
+
+  // Token provider function
+  const tokenProvider = async () => {
+    if (!externalToken) {
+      throw new Error("External token must be provided for 'external' auth type.");
+    }
+    return externalToken;
+  };
+
 
   // ----------------- AUTHENTICATOR -----------------
+  
   let authenticator: (userAssertion?: string) => Promise<string>;
-  if (argv.authentication === "obo") {
-    const clientId = process.env.AZURE_CLIENT_ID;
-    const clientSecret = process.env.AZURE_CLIENT_SECRET;
-    if (!clientId || !clientSecret) {
-      throw new Error(
-        "OBO authentication requires AZURE_CLIENT_ID and AZURE_CLIENT_SECRET environment variables."
-      );
-    }
-    authenticator = createAuthenticator("obo", tenantId, { clientId, clientSecret });
+
+  if (argv.authentication === "external") {
+    authenticator = tokenProvider; // dynamic per-request
   } else {
-    authenticator = createAuthenticator(argv.authentication, tenantId);
+    authenticator = createAuthenticator(argv.authentication, argv.tenant);
   }
+ 
 
   // ----------------- CONFIGURE TOOLS -----------------
   configurePrompts(server);
@@ -140,6 +146,11 @@ async function main() {
   app.post('/mcp', async (req: Request, res: Response) => {
       // Check for existing session ID
       const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      if (argv.authentication === "external") {
+        const token = req.headers["authorization"]?.split(" ")[1]; // Bearer <token>
+        externalToken = token; // store per-request
+      }
+
       let transport: StreamableHTTPServerTransport;
 
       console.log("Body received:", req.body);
