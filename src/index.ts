@@ -37,7 +37,8 @@ const argv = yargs(hideBin(process.argv))
     alias: "o",
     type: "string",
     describe: "Azure DevOps organization name",
-    demandOption: true,
+    demandOption: !process.env.MCP_ORG,   // make CLI required only if ENV is missing
+    default: process.env.MCP_ORG,
   })
   .option("domains", {
     alias: "d",
@@ -45,18 +46,32 @@ const argv = yargs(hideBin(process.argv))
       "Domain(s) to enable: 'all' for everything, or specific domains like 'repositories builds work'. Defaults to 'all'.",
     type: "string",
     array: true,
-    default: "all",
+    default: process.env.MCP_DOMAINS?.split(" ") || ["all"],
   })
   .option("authentication", {
     alias: "a",
     describe: "Type of authentication: 'interactive', 'azcli', 'env', 'external', 'obo'. Default: interactive",
     type: "string",
     choices: ["interactive", "azcli", "env", "external", "obo"],
-    default: defaultAuthenticationType,
+    default: process.env.MCP_AUTH || defaultAuthenticationType,
   })
-  .option("tenant", { alias: "t", type: "string", describe: "Azure tenant ID" })
-  .option("transport", { alias: "x", type: "string", choices: ["stdio", "http"], default: "stdio" })
-  .option("port", { alias: "p", type: "number", default: 3000 })
+  .option("tenant", {
+    alias: "t",
+    type: "string",
+    describe: "Azure tenant ID",
+    default: process.env.MCP_TENANT,
+  })
+  .option("transport", {
+    alias: "x",
+    type: "string",
+    choices: ["stdio", "http"],
+    default: process.env.MCP_TRANSPORT || "stdio",
+  })
+  .option("port", {
+    alias: "p",
+    type: "number",
+    default: process.env.MCP_PORT ? parseInt(process.env.MCP_PORT) : 3000,
+  })
   .help()
   .parseSync();
 
